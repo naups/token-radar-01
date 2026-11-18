@@ -30,15 +30,15 @@
   }
 
   // Recompute a row with the same arithmetic as the model, so the page visibly agrees
-  // with board.json: log10(implied) = intercept + bTvl*log10(TVL) + bGrowth*growth
-  // + bAge*maturity + category offset, converted back to dollars.
+  // with board.json: TVL x category median mcap/TVL multiple x growth tilt x age tilt.
   function impliedOf(row, model) {
+    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
+    var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days;
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var offset = model.catOffset[row.category] === undefined ? model.fallbackOffset : model.catOffset[row.category];
-    var logMcap = model.intercept + model.bTvl * Math.log10(row.tvl_usd) + model.bGrowth * growth / 100 + model.bAge * maturity + offset;
-    return Math.max(1, Math.round(Math.pow(10, logMcap)));
+    var ageMult = 1 + (0.5 - maturity) * model.age_weight;
+    var multiple = model.cat_multiple[row.category] === undefined ? model.fallback_multiple : model.cat_multiple[row.category];
+    return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * ageMult));
   }
 
   function el(tag, attrs) {
@@ -285,9 +285,9 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = 10^( intercept + ' + m.bTvl + '·log10(tvl) + ' + m.bGrowth + '·growth + ' + m.bAge + '·maturity + catOffset )'
+        'implied = round( tvl_usd x categoryMultiple(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (1 + (0.5 - min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ') x ' + m.age_weight + ') )'
       ),
-      el('p', { class: 'sub', text: 'The intercept, weights and category offsets are fitted by least squares on the snapshot\'s own live-token protocols (' + m.live_fit + ' tokens), and the fit\'s leave-one-out R² is ' + (m.loo_r2 * 100).toFixed(1) + '%. The implied value follows only from the snapshot\'s figures, never from a hand-written list of names. Age is the time since the protocol was first listed; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar adds pre-token protocols below the watchlist floor, and live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: 'categoryMultiple is the median market-cap-to-TVL ratio of the live-token protocols in the same category in this snapshot (' + m.live_fit + ' live protocols fitted), falling back to the global median ' + m.fallback_multiple + ' for a category with fewer than three comparables. TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
     );
   }
 

@@ -42,113 +42,63 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  /** OLS coefficients (on log10 scale) fitted on the snapshot's live-token protocols:
-   * log10(mcap) = intercept + bTvl*log10(tvl) + catOffset[cat] + bGrowth*growth + bAge*maturity. */
-  intercept: number;
-  bTvl: number;
-  bGrowth: number;
-  bAge: number;
-  catOffset: Record<string, number>;
-  fallbackOffset: number;
+  /** Category-relative market-cap-to-TVL comparables, fitted on the snapshot's live-token protocols. */
+  cat_multiple: Record<string, number>;
+  /** Fallback multiple for a category with no live comparables, and the number of live protocols fitted. */
+  fallback_multiple: number;
   live_fit: number;
-  loo_r2: number; // leave-one-out R² of the fit on the live tokens themselves
+  growth_weight: number;
   growth_floor: number;
   growth_cap: number;
-  growth_weight: number;
+  age_weight: number;
   maturity_days: number;
   unknown_age_days: number;
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3-ols';
-
-/** Solve for x in A x = b in place (Gaussian elimination, no dependencies). */
-function solveLinear(a: number[][], b: number[]): number[] {
-  const n = b.length;
-  const m = a.map((row, i) => [...row, b[i]!]);
-  for (let col = 0; col < n; col++) {
-    let piv = col;
-    for (let r = col + 1; r < n; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[piv]![col]!)) piv = r;
-    [m[col], m[piv]] = [m[piv]!, m[col]!];
-    const pv = m[col]![col]!;
-    for (let j = col; j <= n; j++) m[col]![j] = m[col]![j]! / pv;
-    for (let r = 0; r < n; r++) {
-      if (r === col) continue;
-      const f = m[r]![col]!;
-      for (let j = col; j <= n; j++) m[r]![j] = m[r]![j]! - f * m[col]![j]!;
-    }
-  }
-  return m.map((row) => row[n]!);
-}
+export const MODEL_VERSION = 'radar-2-comps';
 
 /**
- * Fit a log-log comparables model on the snapshot's own live-token protocols (those with a market
- * cap): log10(mcap) ~ log10(TVL) + 7d growth + maturity, with a per-category intercept. The fit is
- * evaluated with leave-one-out cross-validation and that R² is disclosed on the board. A pre-token
- * protocol's implied value is 10^prediction, converted back to dollars. The model follows only from
- * the snapshot's figures, never from a hand-written list of names.
+ * Fit category-relative multiples on the snapshot's own live-token protocols (those with a market cap):
+ * for each category, the median mcap/TVL of its live tokens. A pre-token protocol's implied value is
+ * its TVL times its category's median multiple. This is a comparables model: it follows only from the
+ * snapshot's figures, never from a hand-written list of names.
  */
 export function fitModel(snapshot: Snapshot): ModelConstants {
-  const live: { tvl: number; growth: number; maturity: number; mcap: number; cat: string }[] = [];
+  const byCategory = new Map<string, number[]>();
+  let total = 0;
   for (const p of snapshot.protocols) {
     if (p.mcap_usd === null || p.tvl_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     if (p.category === 'CEX') continue;
-    const growth = p.change_7d === null ? 0 : Math.min(120, Math.max(-60, p.change_7d)) / 100;
-    let maturity = 0.5;
-    if (p.listed_at !== null) {
-      const age = ageDays(snapshot.as_of, p.listed_at);
-      if (age !== null) maturity = Math.min(Math.max(age, 0), 1095) / 1095;
-    }
-    live.push({ tvl: Math.log10(p.tvl_usd), growth, maturity, mcap: Math.log10(p.mcap_usd), cat: p.category ?? 'Other' });
+    const m = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(m) || m <= 0) continue;
+    const cat = p.category ?? 'Other';
+    const list = byCategory.get(cat) ?? [];
+    list.push(m);
+    byCategory.set(cat, list);
+    total += 1;
   }
-  // Design matrix: [1, log10(tvl), growth, maturity] -> log10(mcap)
-  const X = live.map((r) => [1, r.tvl, r.growth, r.maturity]);
-  const y = live.map((r) => r.mcap);
-  const [intercept, bTvl, bGrowth, bAge] = solveLinear(
-    [0, 1, 2, 3].map((i) => [0, 1, 2, 3].map((j) => X.reduce((s, r) => s + r[i]! * r[j]!, 0))),
-    [0, 1, 2, 3].map((i) => X.reduce((s, r, k) => s + r[i]! * y[k]!, 0)),
-  );
-  // Per-category offset = mean residual
-  const resid: Record<string, number[]> = {};
-  X.forEach((r, k) => {
-    const pred = intercept! + bTvl! * r[1]! + bGrowth! * r[2]! + bAge! * r[3]!;
-    const cat = live[k]!.cat;
-    (resid[cat] ??= []).push(y[k]! - pred);
-  });
-  const catOffset: Record<string, number> = {};
-  const allResid: number[] = [];
-  for (const [cat, rs] of Object.entries(resid)) {
-    catOffset[cat] = rs.reduce((s, r) => s + r, 0) / rs.length;
-    allResid.push(...rs);
+  const median = (xs: number[]): number => {
+    const s = [...xs].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+  };
+  const all: number[] = [];
+  for (const list of byCategory.values()) all.push(...list);
+  const fallback = all.length > 0 ? median(all) : 0.25;
+  const catMultiple: Record<string, number> = {};
+  for (const [cat, list] of byCategory) {
+    // Fewer than 3 live comparables in a category: fall back to the global median.
+    catMultiple[cat] = list.length >= 3 ? median(list) : fallback;
   }
-  const fallbackOffset = allResid.length ? allResid.reduce((s, r) => s + r, 0) / allResid.length : 0;
-  // Leave-one-out R²
-  const mu = y.reduce((s, r) => s + r, 0) / y.length;
-  let ssTot = 0, ssRes = 0;
-  for (let k = 0; k < y.length; k++) {
-    const Xo = X.filter((_, i) => i !== k);
-    const yo = y.filter((_, i) => i !== k);
-    const [c0, c1, c2, c3] = solveLinear(
-      [0, 1, 2, 3].map((i) => [0, 1, 2, 3].map((j) => Xo.reduce((s, r) => s + r[i]! * r[j]!, 0))),
-      [0, 1, 2, 3].map((i) => Xo.reduce((s, r, kk) => s + r[i]! * yo[kk]!, 0)),
-    );
-    const pred = c0! + c1! * X[k]![1]! + c2! * X[k]![2]! + c3! * X[k]![3]!;
-    ssRes += (y[k]! - pred) ** 2;
-    ssTot += (y[k]! - mu) ** 2;
-  }
-  const looR2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
   return {
-    intercept: intercept!,
-    bTvl: bTvl!,
-    bGrowth: bGrowth!,
-    bAge: bAge!,
-    catOffset,
-    fallbackOffset,
-    live_fit: live.length,
-    loo_r2: looR2,
+    cat_multiple: catMultiple,
+    fallback_multiple: fallback,
+    live_fit: total,
+    growth_weight: 0.25,
     growth_floor: -60,
     growth_cap: 120,
-    growth_weight: 1,
+    age_weight: 0.2,
     maturity_days: 1095,
     unknown_age_days: 365,
   };
@@ -268,11 +218,11 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturity = Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days;
-  const maturityMult = 1 + (0.5 - maturity) * 0.2;
-  const logTvl = Math.log10(protocol.tvl_usd);
-  const offset = model.catOffset[protocol.category ?? 'Other'] ?? model.fallbackOffset;
-  const logMcap = model.intercept + model.bTvl * logTvl + model.bGrowth * growthPct / 100 + model.bAge * maturity + offset;
-  const implied = Math.max(1, Math.round(Math.pow(10, logMcap)));
+  // Older protocols trade at a discount to a fresh one: the age tilt is small and within (0.8, 1.2).
+  const maturityMult = 1 + (0.5 - maturity) * model.age_weight;
+  const multiple = model.cat_multiple[protocol.category ?? 'Other'] ?? model.fallback_multiple;
+  const base = protocol.tvl_usd * multiple;
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
@@ -355,7 +305,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants): BoardRow[
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      log_tvl: round4(Math.log10(s.p.tvl_usd)),
+      multiple: model.cat_multiple[s.p.category ?? 'Other'] ?? model.fallback_multiple,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
